@@ -1,0 +1,95 @@
+{
+	"admin/modem": {
+		"title": "Modem",
+		"order": 30,
+		"action": {
+			"type": "firstchild",
+			"recurse": true
+		}
+	},
+	
+	"admin/modem/3ginfo-lite": {
+		"title": "Information about 3G/4G/5G connection",
+		"order": 10,
+		"action": {
+			"type": "alias",
+			"path": "admin/modem/3ginfo-lite/3gdetail"
+		},
+		"depends": {
+			"acl": [ "luci-app-3ginfo-lite" ],
+			"uci": { "3ginfo": true }
+		}
+	},
+	
+	"admin/modem/3ginfo-lite/3gdetail": {
+		"title": "Details",
+		"order": 10,
+		"action": {
+			"type": "view",
+			"path": "modem/3gdetail"
+		}
+	},
+
+	"admin/modem/3ginfo-lite/cellscan": {
+		"title": "Neighbor Cell",
+		"order": 20,
+		"action": {
+			"type": "view",
+			"path": "modem/cellscan"
+		}
+	},
+
+	"admin/modem/3ginfo-lite/sim": {
+		"title": "SIM Status",
+		"order": 25,
+		"action": {
+			"type": "view",
+			"path": "modem/sim"
+		}
+	},
+
+	"admin/modem/3ginfo-lite/imei": {
+		"title": "Set IMEI",
+		"order": 30,
+		"action": {
+			"type": "view",
+			"path": "modem/imei"
+		}
+	},
+
+	"admin/modem/3ginfo-lite/ttl": {
+		"title": "TTL",
+		"order": 35,
+		"action": {
+			"type": "view",
+			"path": "modem/ttl"
+		}
+	},
+
+	"admin/modem/3ginfo-lite/apn": {
+		"title": "APN Dial",
+		"order": 36,
+		"action": {
+			"type": "view",
+			"path": "modem/apn"
+		}
+	},
+
+	"admin/modem/3ginfo-lite/atdebug": {
+		"title": "AT Debug",
+		"order": 38,
+		"action": {
+			"type": "view",
+			"path": "modem/atdebug"
+		}
+	},
+
+	"admin/modem/3ginfo-lite/lockband": {
+		"title": "Lock Band",
+		"order": 40,
+		"action": {
+			"type": "view",
+			"path": "modem/lockband"
+		}
+	}
+}

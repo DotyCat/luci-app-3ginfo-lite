@@ -1,0 +1,895 @@
+# Quectel MTK RG600L-XX
+
+. /usr/share/libubox/jshn.sh
+
+
+modulation2str() {
+# see https://en.wikipedia.org/wiki/5G_NR_frequency_bands
+	case "${1}" in
+		"0") echo "BPSK";;
+		"1") echo "QPSK";;
+		"2") echo "16QAM";;
+		"3") echo "64QAM";;
+		"4") echo "256QAM";;
+		"*") echo "";;
+	esac
+}
+
+bandwidth5g() {
+	case "${1}" in
+		"0") echo "5";;
+		"1") echo "10";;
+		"2") echo "15";;
+		"3") echo "20";;
+		"4") echo "25";;
+		"5") echo "30";;
+		"6") echo "40";;
+		"7") echo "50";;
+		"8") echo "60";;
+		"9") echo "80";;
+		"10") echo "90";;
+		"11") echo "100";;
+		"12") echo "200";;
+		"13") echo "400";;
+		"14") echo "70";;
+		"*") echo "";;
+	esac
+}
+
+bandwidth4g() {
+	case "${1}" in
+		"0") echo "1.4";;
+		"1") echo "3";;
+		"2") echo "5";;
+		"3") echo "10";;
+		"4") echo "15";;
+		"5") echo "20";;
+		"*") echo "";;
+	esac
+}
+
+O=$(mipc_wan_cli --at_cmd "at+qtemp")
+
+T=$(echo "$O" | awk -F[,:] '/^\+QTEMP/ {print $3}' | sort -r | head -n1 | xargs)
+[ -n "$T" ] && TEMP="$T &deg;C"
+
+if [ -z "$REG" ] || [ "x$MODE_NUM" = "x11" ]; then
+	O=$(mipc_wan_cli --at_cmd "at+c5greg=2;+c5greg?" | grep "+C5GREG")
+
+	# C5GREG
+	T=""
+	TAC_HEX=""
+	CID_HEX=""
+	TAC_DEC=""
+	eval $(echo "$O" | busybox awk -F[,] '/^\+C5GREG/ {gsub(/[[:space:]"]+/,"");printf "T=\"%d\";TAC_HEX=\"%X\";CID_HEX=\"%s\";TAC_DEC=\"%d\";MODE_NUM=\"%d\"", $2, "0x"$3, $4, "0x"$3, $5}')
+	case "$T" in
+		0*) REG="0";;
+		1*) REG="1";;
+		2*) REG="2";;
+		3*) REG="3";;
+		5*) REG="5";;
+		*) REG="";;
+	esac
+	[ "x$REG" = "x1" ] || [ "x$REG" = "x5" ] && REGOK=1
+
+	[ -n "$TAC_DEC" ] && [ "$TAC_DEC" != "0" ] && TAC_DEC="${TAC_DEC}"
+	[ -n "$CID_HEX" ] && CID_DEC=$(printf "%d" "0x${CID_HEX}")
+fi
+
+/bin/modem_status --ca_info > /dev/null 2>&1
+/bin/modem_status --cell_info > /dev/null 2>&1
+/bin/modem_status --band_info > /dev/null 2>&1
+/bin/modem_status --sign_info > /dev/null 2>&1
+
+json_init
+
+json_load_file /tmp/modem_cell_info.json
+json_get_var serving_rat serving_rat
+if [ "$serving_rat" = "GSM" ]; then
+    json_select "gsm_info"
+    json_select "1"
+    json_get_var serving_arfcn arfcn
+    json_get_var serving_lac lac
+	MODE="GSM |"
+elif [ "$serving_rat" = "UMTS" ]; then
+    json_select "umts_info"
+    json_select "1"
+    json_get_var serving_arfcn uarfcn
+    json_get_var serving_lac lac
+    json_get_var serving_pci pci
+	MODE="UMTS |"
+elif [ "$serving_rat" = "LTE" ]; then
+    json_select "lte_info"
+    json_select "1"
+    json_get_var serving_arfcn earfcn
+    json_get_var serving_pci pci
+	MODE="LTE |"
+elif [ "$serving_rat" = "NR-SA" ]; then
+    json_select "sa_info"
+    json_select "1"
+    json_get_var serving_arfcn nr_arfcn
+    json_get_var serving_pci pci
+	MODE="5G SA |"
+elif [ "$serving_rat" = "NR-NSA" ]; then
+    json_select "nsa_lte_info"
+    json_select "1"
+    json_get_var serving_arfcn earfcn
+    json_get_var serving_pci pci
+	MODE="5G NSA |"
+fi
+
+json_get_var serving_tac tac
+json_get_var serving_sinr sinr
+json_get_var serving_rssi rssi
+json_get_var serving_rsrp rsrp
+json_get_var serving_rsrq rsrq
+json_get_var serving_cid cid
+TAC_DEC=$(echo "$serving_tac")
+TAC_HEX=$(printf "0x%X" "$TAC_DEC")
+SINR=$(echo "$serving_sinr")
+RSSI=$(echo "$serving_rssi")
+RSRP=$(echo "$serving_rsrp")
+RSRQ=$(echo "$serving_rsrq")
+CID_DEC=$(echo "$serving_cid")
+CID_HEX=$(printf "0x%X" "$CID_DEC")
+EARFCN=$(echo "$serving_arfcn")
+PCI=$(echo "$serving_pci")
+LAC_DEC=$(echo "$serving_lac")
+LAC_HEX=$(printf "0x%X" "$LAC_DEC")
+[ -z "$CSQ_PER" ] && CSQ_PER=$(((RSSI + 113) * 100 / 62 ))
+[ -z "$CSQ" ] && CSQ=$(((31 * CSQ_PER) / 100))
+
+
+format_ambr_rate() {
+	case "$1" in
+		''|*[!0-9]*)
+			echo "-"
+			return
+		;;
+	esac
+
+	if [ "$1" -gt 10240 ]; then
+		awk -v rate="$1" 'BEGIN { value = rate / 1024; if (value == int(value)) printf "%d Mbps", value; else printf "%.2f Mbps", value }'
+	else
+		echo "$1 Kbps"
+	fi
+}
+
+AMBR_RAW=$(mipc_wan_cli --at_cmd "AT+C5GQOSRDP=1" | tr -d '\r' | sed -n 's/^[[:space:]]*+C5GQOSRDP:[[:space:]]*//p' | sed -n '1p')
+AMBR_QCI=$(echo "$AMBR_RAW" | cut -d, -f2)
+AMBR_DL=$(echo "$AMBR_RAW" | cut -d, -f7)
+AMBR_UL=$(echo "$AMBR_RAW" | cut -d, -f8)
+if [ -n "$AMBR_QCI" ] && [ -n "$AMBR_DL" ] && [ -n "$AMBR_UL" ]; then
+	AMBR="DL: $(format_ambr_rate "$AMBR_DL") UL:$(format_ambr_rate "$AMBR_UL") QCI:$AMBR_QCI"
+else
+	AMBR="-"
+fi
+
+
+json_load_file /tmp/modem_ca_info.json
+json_get_var lte_pcc_num lte_pcc_num
+json_get_var lte_scc_num lte_scc_num
+json_get_var nr_pcc_num nr_pcc_num
+json_get_var nr_scc_num nr_scc_num
+lte_pcc_num=$(printf "%d" "${lte_pcc_num:-0}")
+lte_scc_num=$(printf "%d" "${lte_scc_num:-0}")
+nr_pcc_num=$(printf "%d" "${nr_pcc_num:-0}")
+nr_scc_num=$(printf "%d" "${nr_scc_num:-0}")
+
+if [ "$serving_rat" = "LTE" ]; then
+	if [ "$lte_scc_num" -gt 0 ]; then
+		MODE="LTE-A |"
+	fi
+fi
+
+if [ "$lte_pcc_num" -gt 0 ] && [ "$lte_scc_num" -eq 0 ] && [ "$nr_pcc_num" -eq 0 ] && [ "$nr_scc_num" -eq 0 ]; then
+    CA_MODE="LTE"
+elif [ "$nr_pcc_num" -gt 0 ] && [ "$lte_pcc_num" -eq 0 ] && [ "$lte_scc_num" -eq 0 ] && [ "$nr_scc_num" -eq 0 ]; then
+    CA_MODE="NR"
+elif [ "$lte_pcc_num" -gt 0 ] && [ "$lte_scc_num" -gt 0 ] && [ "$nr_pcc_num" -eq 0 ] && [ "$nr_scc_num" -eq 0 ]; then
+    CA_MODE="LTE-CA"
+elif [ "$nr_pcc_num" -gt 0 ] && [ "$nr_scc_num" -gt 0 ] && [ "$lte_pcc_num" -eq 0 ] && [ "$lte_scc_num" -eq 0 ]; then
+    CA_MODE="NR-CA"
+elif [ "$lte_pcc_num" -gt 0 ] && [ "$nr_scc_num" -gt 0 ] && [ "$lte_scc_num" -eq 0 ] && [ "$nr_pcc_num" -eq 0 ]; then
+    CA_MODE="LTE-ENDC"
+elif [ "$nr_pcc_num" -gt 0 ] && [ "$lte_scc_num" -gt 0 ] && [ "$lte_pcc_num" -eq 0 ] && [ "$nr_scc_num" -eq 0 ]; then
+    CA_MODE="NR-ENDC"
+else
+    CA_MODE="UNKNOWN"
+fi
+
+if [ "$CA_MODE" = "NR" ] || [ "$CA_MODE" = "NR-CA" ] || [ "$CA_MODE" = "NR-ENDC" ]; then
+	json_select "nr_pcc_info"
+	json_select "1"
+	json_get_var pcc_dl_bw_nr nr_pcc_dl_bandwidth
+	json_get_var pcc_ul_bw_nr nr_pcc_ul_bandwidth
+	json_get_var pcc_dynamic_dl_bw_nr nr_pcc_dl_bwp_bandwidth
+	json_get_var pcc_dynamic_ul_bw_nr nr_pcc_ul_bwp_bandwidth
+	json_get_var pcc_dl_rb_nr nr_pcc_dl_rb
+	json_get_var pcc_ul_rb_nr nr_pcc_ul_rb
+	json_get_var pcc_dl_tput_nr nr_pcc_dl_tput
+	json_get_var pcc_ul_tput_nr nr_pcc_ul_tput
+	json_get_var pcc_dl_modulation_nr nr_pcc_dl_modulation
+	json_get_var pcc_ul_modulation_nr nr_pcc_ul_modulation
+	json_get_var pcc_dl_mimo_nr nr_pcc_dl_mimo
+	json_get_var pcc_ul_mimo_nr nr_pcc_ul_mimo
+	json_get_var pcc_dl_mcs_nr nr_pcc_dl_mcs
+	json_get_var pcc_ul_mcs_nr nr_pcc_ul_mcs
+	json_get_var pcc_pucch_tx_pwr_nr nr_pcc_pucch_tx_pwr
+	json_get_var pcc_pusch_tx_pwr_nr nr_pcc_pusch_tx_pwr
+	json_get_var pcc_band nr_pcc_band
+	json_select ..
+	json_select ..
+	T=$(echo "$pcc_dl_bw_nr" | xargs)
+	DBW=$(bandwidth5g ${T})
+	T=$(echo "$pcc_ul_bw_nr" | xargs)
+	UBW=$(bandwidth5g ${T})
+	T=$(echo "$pcc_dynamic_dl_bw_nr" | xargs)
+	DYDBW=$(bandwidth5g ${T})
+	T=$(echo "$pcc_dynamic_ul_bw_nr" | xargs)
+	DYUBW=$(bandwidth5g ${T})
+	[ -n "$DBW" ] && DLBW="$DBW"
+	[ -n "$UBW" ] && ULBW="$UBW"
+	[ -n "$DYDBW" ] && DYDLBW="$DYDBW"
+	[ -n "$DYUBW" ] && DYULBW="$DYUBW"
+	PBAND=$(band5g ${pcc_band})
+	PBW="DL: $DYDLBW MHz / $DLBW MHz & $pcc_dl_rb_nr | UL: $DYULBW MHz / $ULBW MHz & $pcc_ul_rb_nr"
+	MODE="$MODE $(band5g ${pcc_band})"
+	pcc_dl_tput_nr=$((pcc_dl_tput_nr * 8))
+	pcc_ul_tput_nr=$((pcc_ul_tput_nr * 8))
+	if [ "$pcc_dl_tput_nr" -ge $((1024 * 1024)) ]; then
+		DLSPEED=$(awk "BEGIN {printf \"%.2f Gbps\", $pcc_dl_tput_nr / (1024 * 1024)}")
+	elif [ "$pcc_dl_tput_nr" -ge 1024 ]; then
+		DLSPEED=$(awk "BEGIN {printf \"%.2f Mbps\", $pcc_dl_tput_nr / 1024}")
+	else
+		DLSPEED=$(awk "BEGIN {printf \"%.2f Kbps\", $pcc_dl_tput_nr}")
+	fi
+	if [ "$pcc_ul_tput_nr" -ge $((1024 * 1024)) ]; then
+		ULSPEED=$(awk "BEGIN {printf \"%.2f Gbps\", $pcc_ul_tput_nr / (1024 * 1024)}")
+	elif [ "$pcc_ul_tput_nr" -ge 1024 ]; then
+		ULSPEED=$(awk "BEGIN {printf \"%.2f Mbps\", $pcc_ul_tput_nr / 1024}")
+	else
+		ULSPEED=$(awk "BEGIN {printf \"%.2f Kbps\", $pcc_ul_tput_nr}")
+	fi
+	PSPEED="DL: $DLSPEED | UL: $ULSPEED"
+	PMCS="DL: $pcc_dl_mimo_nr & $pcc_dl_mcs_nr & $(modulation2str ${pcc_dl_modulation_nr}) | UL: $pcc_ul_mimo_nr & $pcc_ul_mcs_nr & $(modulation2str ${pcc_ul_modulation_nr})"
+	PTWR="PUCCH: $pcc_pucch_tx_pwr_nr dBm | PUSCH: $pcc_pusch_tx_pwr_nr dBm"
+elif [ "$CA_MODE" = "LTE" ] || [ "$CA_MODE" = "LTE-CA" ] || [ "$CA_MODE" = "LTE-ENDC" ]; then
+	json_select "lte_pcc_info"
+	json_select "1"
+	json_get_var pcc_dl_bw_lte lte_pcc_dl_bandwidth
+	json_get_var pcc_ul_bw_lte lte_pcc_ul_bandwidth
+	json_get_var pcc_dynamic_dl_bw_lte lte_pcc_dl_bwp_bandwidth
+	json_get_var pcc_dynamic_ul_bw_lte lte_pcc_ul_bwp_bandwidth
+	json_get_var pcc_dl_tput_lte lte_pcc_dl_tput
+	json_get_var pcc_ul_tput_lte lte_pcc_ul_tput
+	json_get_var pcc_dl_modulation_lte lte_pcc_dl_modulation
+	json_get_var pcc_ul_modulation_lte lte_pcc_ul_modulation
+	json_get_var pcc_dl_mimo_lte lte_pcc_dl_mimo
+	json_get_var pcc_ul_mimo_lte lte_pcc_ul_mimo
+	json_get_var pcc_dl_mcs_lte lte_pcc_dl_mcs
+	json_get_var pcc_ul_mcs_lte lte_pcc_ul_mcs
+	json_get_var pcc_pucch_tx_pwr_lte lte_pcc_pucch_tx_pwr
+	json_get_var pcc_pusch_tx_pwr_lte lte_pcc_pusch_tx_pwr
+	json_get_var pcc_band lte_pcc_band
+	json_select ..
+	json_select ..
+	T=$(echo "$pcc_dl_bw_lte")
+	DBW=$(bandwidth4g ${T})
+	T=$(echo "$pcc_ul_bw_lte")
+	UBW=$(bandwidth4g ${T})
+	T=$(echo "$pcc_dynamic_dl_bw_lte")
+	DYDBW=$(bandwidth4g ${T})
+	T=$(echo "$pcc_dynamic_ul_bw_lte")
+	DYUBW=$(bandwidth4g ${T})
+	[ -n "$DBW" ] && DLBW="$DBW"
+	[ -n "$UBW" ] && ULBW="$UBW"
+	[ -n "$DYDBW" ] && DYDLBW="$DYDBW"
+	[ -n "$DYUBW" ] && DYULBW="$DYUBW"
+	PBAND=$(band4g ${pcc_band})
+	PBW="DL: $DYDLBW MHz / $DLBW MHz | UL: $DYULBW MHz / $ULBW MHz"
+	MODE="$MODE $(band4g ${pcc_band})"
+	pcc_dl_tput_lte=$((pcc_dl_tput_lte * 8))
+	pcc_ul_tput_lte=$((pcc_ul_tput_lte * 8))
+	if [ "$pcc_dl_tput_lte" -ge $((1024 * 1024)) ]; then
+		DLSPEED=$(awk "BEGIN {printf \"%.2f Gbps\", $pcc_dl_tput_lte / (1024 * 1024)}")
+	elif [ "$pcc_dl_tput_lte" -ge 1024 ]; then
+		DLSPEED=$(awk "BEGIN {printf \"%.2f Mbps\", $pcc_dl_tput_lte / 1024}")
+	else
+		DLSPEED=$(awk "BEGIN {printf \"%.2f Kbps\", $pcc_dl_tput_lte}")
+	fi
+	if [ "$pcc_ul_tput_lte" -ge $((1024 * 1024)) ]; then
+		ULSPEED=$(awk "BEGIN {printf \"%.2f Gbps\", $pcc_ul_tput_lte / (1024 * 1024)}")
+	elif [ "$pcc_ul_tput_lte" -ge 1024 ]; then
+		ULSPEED=$(awk "BEGIN {printf \"%.2f Mbps\", $pcc_ul_tput_lte / 1024}")
+	else
+		ULSPEED=$(awk "BEGIN {printf \"%.2f Kbps\", $pcc_ul_tput_lte}")
+	fi
+	PSPEED="DL: $DLSPEED | UL: $ULSPEED"
+	PMCS="DL: $pcc_dl_mimo_lte & $pcc_dl_mcs_lte & $pcc_dl_modulation_lte | UL: $pcc_ul_mimo_lte & $pcc_ul_mcs_lte & $pcc_ul_modulation_lte"
+	PTWR="PUCCH: $pcc_pucch_tx_pwr_lte dBm | PUSCH: $pcc_pusch_tx_pwr_lte dBm"
+fi
+
+if [ "$CA_MODE" = "NR-CA" ]; then
+    if json_is_a "nr_scc_info" array; then
+        json_select "nr_scc_info"
+        idx=1
+        while json_is_a "$idx" object; do
+            json_select "$idx"
+			json_get_var scc_dl_bw_nr nr_scc_dl_bandwidth
+			json_get_var scc_ul_bw_nr nr_scc_ul_bandwidth
+			json_get_var scc_dynamic_dl_bw_nr nr_scc_dl_bwp_bandwidth
+			json_get_var scc_dynamic_ul_bw_nr nr_scc_ul_bwp_bandwidth
+			json_get_var scc_dl_rb_nr nr_scc_dl_rb
+			json_get_var scc_ul_rb_nr nr_scc_ul_rb
+			json_get_var scc_dl_tput_nr nr_scc_dl_tput
+			json_get_var scc_ul_tput_nr nr_scc_ul_tput
+			json_get_var scc_dl_modulation_nr nr_scc_dl_modulation
+			json_get_var scc_ul_modulation_nr nr_scc_ul_modulation
+			json_get_var scc_dl_mimo_nr nr_scc_dl_mimo
+			json_get_var scc_ul_mimo_nr nr_scc_ul_mimo
+			json_get_var scc_dl_mcs_nr nr_scc_dl_mcs
+			json_get_var scc_ul_mcs_nr nr_scc_ul_mcs
+			json_get_var scc_pucch_tx_pwr_nr nr_scc_pucch_tx_pwr
+			json_get_var scc_pusch_tx_pwr_nr nr_scc_pusch_tx_pwr
+			json_get_var scc_band nr_scc_band
+			json_get_var scc_pci nr_scc_pci
+			json_get_var scc_arfcn nr_scc_arfcn
+			T=$(echo "$scc_dl_bw_nr" | xargs)
+			DBW=$(bandwidth5g ${T})
+			T=$(echo "$scc_ul_bw_nr" | xargs)
+			UBW=$(bandwidth5g ${T})
+			T=$(echo "$scc_dynamic_dl_bw_nr" | xargs)
+			DYDBW=$(bandwidth5g ${T})
+			T=$(echo "$scc_dynamic_ul_bw_nr" | xargs)
+			DYUBW=$(bandwidth5g ${T})
+			[ -n "$DBW" ] && DLBW="$DBW"
+			[ -n "$UBW" ] && ULBW="$UBW"
+			[ -n "$DYDBW" ] && DYDLBW="$DYDBW"
+			[ -n "$DYUBW" ] && DYULBW="$DYUBW"
+            eval "S${idx}BAND=\$(band5g \${scc_band})"
+			eval "S${idx}PCI=\${scc_pci}"
+			eval "S${idx}EARFCN=\${scc_arfcn}"
+            eval "S${idx}BW=\"DL: \$DYDLBW MHz / \$DLBW MHz & \$scc_dl_rb_nr | UL: \$DYULBW MHz / \$ULBW MHz & \$scc_ul_rb_nr\""
+			json_get_var nr_scc_band nr_scc_band
+			MODE="$MODE $(band5g ${nr_scc_band})"
+			scc_dl_tput_nr=$((scc_dl_tput_nr * 8))
+			scc_ul_tput_nr=$((scc_ul_tput_nr * 8))
+			if [ "$scc_dl_tput_nr" -ge $((1024 * 1024)) ]; then
+				DLSPEED=$(awk "BEGIN {printf \"%.2f Gbps\", $scc_dl_tput_nr / (1024 * 1024)}")
+			elif [ "$scc_dl_tput_nr" -ge 1024 ]; then
+				DLSPEED=$(awk "BEGIN {printf \"%.2f Mbps\", $scc_dl_tput_nr / 1024}")
+			else
+				DLSPEED=$(awk "BEGIN {printf \"%.2f Kbps\", $scc_dl_tput_nr}")
+			fi
+			if [ "$scc_ul_tput_nr" -ge $((1024 * 1024)) ]; then
+				ULSPEED=$(awk "BEGIN {printf \"%.2f Gbps\", $scc_ul_tput_nr / (1024 * 1024)}")
+			elif [ "$scc_ul_tput_nr" -ge 1024 ]; then
+				ULSPEED=$(awk "BEGIN {printf \"%.2f Mbps\", $scc_ul_tput_nr / 1024}")
+			else
+				ULSPEED=$(awk "BEGIN {printf \"%.2f Kbps\", $scc_ul_tput_nr}")
+			fi
+            eval "S${idx}SPEED=\"DL: \$DLSPEED | UL: \$ULSPEED\""
+            eval "S${idx}MCS=\"DL: \$scc_dl_mimo_nr & \$scc_dl_mcs_nr & \$(modulation2str \${scc_dl_modulation_nr}) | UL: \$scc_ul_mimo_nr & \$scc_ul_mcs_nr & \$(modulation2str \${scc_ul_modulation_nr})\""
+            eval "S${idx}TWR=\"PUCCH: \$scc_pucch_tx_pwr_nr dBm | PUSCH: \$scc_pusch_tx_pwr_nr dBm\""
+            json_select ..
+            idx=$((idx + 1))
+        done
+        json_select ..
+    fi
+elif [ "$CA_MODE" = "LTE-CA" ]; then
+    if json_is_a "lte_scc_info" array; then
+		MODE="$MODE / "
+        json_select "lte_scc_info"
+        idx=1
+        while json_is_a "$idx" object; do
+			json_get_var scc_dl_bw_lte lte_scc_dl_bandwidth
+			json_get_var scc_ul_bw_lte lte_scc_ul_bandwidth
+			json_get_var scc_dynamic_dl_bw_lte lte_scc_dl_bwp_bandwidth
+			json_get_var scc_dynamic_ul_bw_lte lte_scc_ul_bwp_bandwidth
+			json_get_var scc_dl_tput_lte lte_scc_dl_tput
+			json_get_var scc_ul_tput_lte lte_scc_ul_tput
+			json_get_var scc_dl_modulation_lte lte_scc_dl_modulation
+			json_get_var scc_ul_modulation_lte lte_scc_ul_modulation
+			json_get_var scc_dl_mimo_lte lte_scc_dl_mimo
+			json_get_var scc_ul_mimo_lte lte_scc_ul_mimo
+			json_get_var scc_dl_mcs_lte lte_scc_dl_mcs
+			json_get_var scc_ul_mcs_lte lte_scc_ul_mcs
+			json_get_var scc_pucch_tx_pwr_lte lte_scc_pucch_tx_pwr
+			json_get_var scc_pusch_tx_pwr_lte lte_scc_pusch_tx_pwr
+			json_get_var scc_band lte_scc_band
+			json_get_var scc_pci lte_scc_pci
+			json_get_var scc_arfcn lte_scc_arfcn
+			T=$(echo "$scc_dl_bw_lte")
+			DBW=$(bandwidth4g ${T})
+			T=$(echo "$scc_ul_bw_lte")
+			UBW=$(bandwidth4g ${T})
+			T=$(echo "$scc_dynamic_dl_bw_lte")
+			DYDBW=$(bandwidth4g ${T})
+			T=$(echo "$scc_dynamic_ul_bw_lte")
+			DYUBW=$(bandwidth4g ${T})
+			[ -n "$DBW" ] && DLBW="$DBW"
+			[ -n "$UBW" ] && ULBW="$UBW"
+			[ -n "$DYDBW" ] && DYDLBW="$DYDBW"
+			[ -n "$DYUBW" ] && DYULBW="$DYUBW"
+			eval "S${idx}BAND=\$(band4g \${scc_band})"
+			eval "S${idx}PCI=\${scc_pci}"
+			eval "S${idx}EARFCN=\${scc_arfcn}"
+			eval "S${idx}BW=\"DL: \$DYDLBW MHz / \$DLBW MHz | UL: \$DYULBW MHz / \$ULBW MHz\""
+			MODE="$MODE $(band4g ${scc_band})"
+			scc_dl_tput_lte=$((scc_dl_tput_lte * 8))
+			scc_ul_tput_lte=$((scc_ul_tput_lte * 8))
+			if [ "$scc_dl_tput_lte" -ge $((1024 * 1024)) ]; then
+				DLSPEED=$(awk "BEGIN {printf \"%.2f Gbps\", $scc_dl_tput_lte / (1024 * 1024)}")
+			elif [ "$scc_dl_tput_lte" -ge 1024 ]; then
+				DLSPEED=$(awk "BEGIN {printf \"%.2f Mbps\", $scc_dl_tput_lte / 1024}")
+			else
+				DLSPEED=$(awk "BEGIN {printf \"%.2f Kbps\", $scc_dl_tput_lte}")
+			fi
+			if [ "$scc_ul_tput_lte" -ge $((1024 * 1024)) ]; then
+				ULSPEED=$(awk "BEGIN {printf \"%.2f Gbps\", $scc_ul_tput_lte / (1024 * 1024)}")
+			elif [ "$scc_ul_tput_lte" -ge 1024 ]; then
+				ULSPEED=$(awk "BEGIN {printf \"%.2f Mbps\", $scc_ul_tput_lte / 1024}")
+			else
+				ULSPEED=$(awk "BEGIN {printf \"%.2f Kbps\", $scc_ul_tput_lte}")
+			fi
+			eval "S${idx}SPEED=\"DL: \$DLSPEED | UL: \$ULSPEED\""
+			eval "S${idx}MCS=\"DL: \$scc_dl_mimo_lte & \$scc_dl_mcs_lte & \$scc_dl_modulation_lte | UL: \$scc_ul_mimo_lte & \$scc_ul_mcs_lte & \$scc_ul_modulation_lte\""
+			eval "S${idx}TWR=\"PUCCH: \$scc_pucch_tx_pwr_lte dBm | PUSCH: \$scc_pusch_tx_pwr_lte dBm\""
+            json_select ..
+            idx=$((idx + 1))
+        done
+        json_select ..
+    fi
+elif [ "$CA_MODE" = "NR-ENDC" ] || [ "$CA_MODE" = "LTE-ENDC" ]; then
+    if json_is_a "nr_scc_info" array; then
+		MODE="$MODE / "
+        json_select "nr_scc_info"
+        idx=1
+        while json_is_a "$idx" object; do
+            json_select "$idx"
+			json_get_var scc_dl_bw_nr nr_scc_dl_bandwidth
+			json_get_var scc_ul_bw_nr nr_scc_ul_bandwidth
+			json_get_var scc_dynamic_dl_bw_nr nr_scc_dl_bwp_bandwidth
+			json_get_var scc_dynamic_ul_bw_nr nr_scc_ul_bwp_bandwidth
+			json_get_var scc_dl_rb_nr nr_scc_dl_rb
+			json_get_var scc_ul_rb_nr nr_scc_ul_rb
+			json_get_var scc_dl_tput_nr nr_scc_dl_tput
+			json_get_var scc_ul_tput_nr nr_scc_ul_tput
+			json_get_var scc_dl_modulation_nr nr_scc_dl_modulation
+			json_get_var scc_ul_modulation_nr nr_scc_ul_modulation
+			json_get_var scc_dl_mimo_nr nr_scc_dl_mimo
+			json_get_var scc_ul_mimo_nr nr_scc_ul_mimo
+			json_get_var scc_dl_mcs_nr nr_scc_dl_mcs
+			json_get_var scc_ul_mcs_nr nr_scc_ul_mcs
+			json_get_var scc_pucch_tx_pwr_nr nr_scc_pucch_tx_pwr
+			json_get_var scc_pusch_tx_pwr_nr nr_scc_pusch_tx_pwr
+			json_get_var scc_band nr_scc_band
+			json_get_var scc_pci nr_scc_pci
+			json_get_var scc_arfcn nr_scc_arfcn
+			T=$(echo "$scc_dl_bw_nr" | xargs)
+			DBW=$(bandwidth5g ${T})
+			T=$(echo "$scc_ul_bw_nr" | xargs)
+			UBW=$(bandwidth5g ${T})
+			T=$(echo "$scc_dynamic_dl_bw_nr" | xargs)
+			DYDBW=$(bandwidth5g ${T})
+			T=$(echo "$scc_dynamic_ul_bw_nr" | xargs)
+			DYUBW=$(bandwidth5g ${T})
+			[ -n "$DBW" ] && DLBW="$DBW"
+			[ -n "$UBW" ] && ULBW="$UBW"
+			[ -n "$DYDBW" ] && DYDLBW="$DYDBW"
+			[ -n "$DYUBW" ] && DYULBW="$DYUBW"
+            eval "S${idx}BAND=\$(band5g \${scc_band})"
+			eval "S${idx}PCI=\${scc_pci}"
+			eval "S${idx}EARFCN=\${scc_arfcn}"
+            eval "S${idx}BW=\"DL: \$DYDLBW MHz / \$DLBW MHz & \$scc_dl_rb_nr | UL: \$DYULBW MHz / \$ULBW MHz & \$scc_ul_rb_nr\""
+			json_get_var nr_scc_band nr_scc_band
+			MODE="$MODE $(band5g ${nr_scc_band})"
+			scc_dl_tput_nr=$((scc_dl_tput_nr * 8))
+			scc_ul_tput_nr=$((scc_ul_tput_nr * 8))
+			if [ "$scc_dl_tput_nr" -ge $((1024 * 1024)) ]; then
+				DLSPEED=$(awk "BEGIN {printf \"%.2f Gbps\", $scc_dl_tput_nr / (1024 * 1024)}")
+			elif [ "$scc_dl_tput_nr" -ge 1024 ]; then
+				DLSPEED=$(awk "BEGIN {printf \"%.2f Mbps\", $scc_dl_tput_nr / 1024}")
+			else
+				DLSPEED=$(awk "BEGIN {printf \"%.2f Kbps\", $scc_dl_tput_nr}")
+			fi
+			if [ "$scc_ul_tput_nr" -ge $((1024 * 1024)) ]; then
+				ULSPEED=$(awk "BEGIN {printf \"%.2f Gbps\", $scc_ul_tput_nr / (1024 * 1024)}")
+			elif [ "$scc_ul_tput_nr" -ge 1024 ]; then
+				ULSPEED=$(awk "BEGIN {printf \"%.2f Mbps\", $scc_ul_tput_nr / 1024}")
+			else
+				ULSPEED=$(awk "BEGIN {printf \"%.2f Kbps\", $scc_ul_tput_nr}")
+			fi
+            eval "S${idx}SPEED=\"DL: \$DLSPEED | UL: \$ULSPEED\""
+            eval "S${idx}MCS=\"DL: \$scc_dl_mimo_nr & \$scc_dl_mcs_nr & \$(modulation2str \${scc_dl_modulation_nr}) | UL: \$scc_ul_mimo_nr & \$scc_ul_mcs_nr & \$(modulation2str \${scc_ul_modulation_nr})\""
+            eval "S${idx}TWR=\"PUCCH: \$scc_pucch_tx_pwr_nr dBm | PUSCH: \$scc_pusch_tx_pwr_nr dBm\""
+            json_select ..
+            idx=$((idx + 1))
+        done
+        json_select ..
+    fi
+    if json_is_a "lte_scc_info" array; then
+		MODE="$MODE / "
+        json_select "lte_scc_info"
+        idx=1
+        while json_is_a "$idx" object; do
+			json_get_var scc_dl_bw_lte lte_scc_dl_bandwidth
+			json_get_var scc_ul_bw_lte lte_scc_ul_bandwidth
+			json_get_var scc_dynamic_dl_bw_lte lte_scc_dl_bwp_bandwidth
+			json_get_var scc_dynamic_ul_bw_lte lte_scc_ul_bwp_bandwidth
+			json_get_var scc_dl_tput_lte lte_scc_dl_tput
+			json_get_var scc_ul_tput_lte lte_scc_ul_tput
+			json_get_var scc_dl_modulation_lte lte_scc_dl_modulation
+			json_get_var scc_ul_modulation_lte lte_scc_ul_modulation
+			json_get_var scc_dl_mimo_lte lte_scc_dl_mimo
+			json_get_var scc_ul_mimo_lte lte_scc_ul_mimo
+			json_get_var scc_dl_mcs_lte lte_scc_dl_mcs
+			json_get_var scc_ul_mcs_lte lte_scc_ul_mcs
+			json_get_var scc_pucch_tx_pwr_lte lte_scc_pucch_tx_pwr
+			json_get_var scc_pusch_tx_pwr_lte lte_scc_pusch_tx_pwr
+			json_get_var scc_band lte_scc_band
+			json_get_var scc_pci lte_scc_pci
+			json_get_var scc_arfcn lte_scc_arfcn
+			known_scc_num=$nr_scc_num + $idx
+			if [ "$idx" -gt 4 ]; then
+				break
+			fi
+			T=$(echo "$scc_dl_bw_lte")
+			DBW=$(bandwidth4g ${T})
+			T=$(echo "$scc_ul_bw_lte")
+			UBW=$(bandwidth4g ${T})
+			T=$(echo "$scc_dynamic_dl_bw_lte")
+			DYDBW=$(bandwidth4g ${T})
+			T=$(echo "$scc_dynamic_ul_bw_lte")
+			DYUBW=$(bandwidth4g ${T})
+			[ -n "$DBW" ] && DLBW="$DBW"
+			[ -n "$UBW" ] && ULBW="$UBW"
+			[ -n "$DYDBW" ] && DYDLBW="$DYDBW"
+			[ -n "$DYUBW" ] && DYULBW="$DYUBW"
+			eval "S${known_scc_num}BAND=\$(band4g \${scc_band})"
+			eval "S${known_scc_num}PCI=\${scc_pci}"
+			eval "S${known_scc_num}EARFCN=\${scc_arfcn}"
+			eval "S${known_scc_num}BW=\"DL: \$DYDLBW MHz / \$DLBW MHz | UL: \$DYULBW MHz / \$ULBW MHz\""
+			MODE="$MODE $(band4g ${scc_band})"
+			scc_dl_tput_lte=$((scc_dl_tput_lte * 8))
+			scc_ul_tput_lte=$((scc_ul_tput_lte * 8))
+			if [ "$scc_dl_tput_lte" -ge $((1024 * 1024)) ]; then
+				DLSPEED=$(awk "BEGIN {printf \"%.2f Gbps\", $scc_dl_tput_lte / (1024 * 1024)}")
+			elif [ "$scc_dl_tput_lte" -ge 1024 ]; then
+				DLSPEED=$(awk "BEGIN {printf \"%.2f Mbps\", $scc_dl_tput_lte / 1024}")
+			else
+				DLSPEED=$(awk "BEGIN {printf \"%.2f Kbps\", $scc_dl_tput_lte}")
+			fi
+			if [ "$scc_ul_tput_lte" -ge $((1024 * 1024)) ]; then
+				ULSPEED=$(awk "BEGIN {printf \"%.2f Gbps\", $scc_ul_tput_lte / (1024 * 1024)}")
+			elif [ "$scc_ul_tput_lte" -ge 1024 ]; then
+				ULSPEED=$(awk "BEGIN {printf \"%.2f Mbps\", $scc_ul_tput_lte / 1024}")
+			else
+				ULSPEED=$(awk "BEGIN {printf \"%.2f Kbps\", $scc_ul_tput_lte}")
+			fi
+			eval "S${known_scc_num}SPEED=\"DL: \$DLSPEED | UL: \$ULSPEED\""
+			eval "S${known_scc_num}MCS=\"DL: \$scc_dl_mimo_lte & \$scc_dl_mcs_lte & \$scc_dl_modulation_lte | UL: \$scc_ul_mimo_lte & \$scc_ul_mcs_lte & \$scc_ul_modulation_lte\""
+			eval "S${known_scc_num}TWR=\"PUCCH: \$scc_pucch_tx_pwr_lte dBm | PUSCH: \$scc_pusch_tx_pwr_lte dBm\""
+            json_select ..
+            idx=$((idx + 1))
+        done
+        json_select ..
+    fi
+fi
+
+
+# if [ "$nr_scc_num" -gt 0 ] || [ "$lte_scc_num" -gt 0 ]; then
+#     if [ "$nr_scc_num" -gt 0 ]; then
+#         if json_is_a "nr_scc_info" array; then
+#             json_select "nr_scc_info"
+#             idx=1
+#             while json_is_a "$idx" object; do
+#                 json_select "$idx"
+#                 json_get_var nr_scc_band nr_scc_band
+#                 MODE="$MODE / $(band5g ${nr_scc_band})"
+#                 json_select ..
+#                 idx=$((idx + 1))
+#             done
+#             json_select ..
+#         fi
+#     elif [ "$lte_scc_num" -gt 0 ]; then
+#         if json_is_a "lte_scc_info" array; then
+#             json_select "lte_scc_info"
+#             idx=1
+#             while json_is_a "$idx" object; do
+#                 json_select "$idx"
+#                 json_get_var lte_scc_band lte_scc_band
+#                 MODE="$MODE / $(band4g ${lte_scc_band})"
+#                 json_select ..
+#                 idx=$((idx + 1))
+#             done
+#             json_select ..
+#         fi
+#     fi
+# fi
+
+json_load_file /tmp/modem_signal_strength.json
+if [ "$CA_MODE" = "NR" ] || [ "$CA_MODE" = "NR-CA" ] ; then
+	json_select "nr_info"
+	json_select "1"
+	json_get_var nr_cc_num nr_cc_num
+	if json_is_a "nr_cc_info" array; then
+		json_select "nr_cc_info"
+		id=0
+		idx=1
+		while json_is_a "$idx" object; do
+			json_select "$idx"
+			json_get_var nr5g_cc_type nr5g_cc_type
+			if [ "$nr5g_cc_type" = "NR PCC" ]; then
+				json_get_var prssi_rx0 rssi_rx0
+				json_get_var prssi_rx1 rssi_rx1
+				json_get_var prssi_rx2 rssi_rx2
+				json_get_var prssi_rx3 rssi_rx3
+				json_get_var trs_prsrp_rx0 trs_rsrp_rx0
+				json_get_var trs_prsrp_rx1 trs_rsrp_rx1
+				json_get_var trs_prsrp_rx2 trs_rsrp_rx2
+				json_get_var trs_prsrp_rx3 trs_rsrp_rx3
+				json_get_var trs_psinr_rx0 trs_snr_rx0
+				json_get_var trs_psinr_rx1 trs_snr_rx1
+				json_get_var trs_psinr_rx2 trs_snr_rx2
+				json_get_var trs_psinr_rx3 trs_snr_rx3
+				json_get_var ssb_prsrp_rx0 ssb_rsrp_rx0
+				json_get_var ssb_prsrp_rx1 ssb_rsrp_rx1
+				json_get_var ssb_prsrp_rx2 ssb_rsrp_rx2
+				json_get_var ssb_prsrp_rx3 ssb_rsrp_rx3
+				json_get_var ssb_psinr_rx0 ssb_snr_rx0
+				json_get_var ssb_psinr_rx1 ssb_snr_rx1
+				json_get_var ssb_psinr_rx2 ssb_snr_rx2
+				json_get_var ssb_psinr_rx3 ssb_snr_rx3
+				PRSSI="$prssi_rx0 dBm | $prssi_rx1 dBm | $prssi_rx2 dBm | $prssi_rx3 dBm"
+				if [[ "$trs_prsrp_rx0" != "-255" && "$trs_prsrp_rx0" != "0" && "$trs_prsrp_rx0" != "" ]]; then
+					PRSRP="$trs_prsrp_rx0 dBm | $trs_prsrp_rx1 dBm | $trs_prsrp_rx2 dBm | $trs_prsrp_rx3 dBm"
+					PSINR="$trs_psinr_rx0 dB | $trs_psinr_rx1 dB | $trs_psinr_rx2 dB | $trs_psinr_rx3 dB"
+				elif [[ "$ssb_prsrp_rx0" != "-255" && "$ssb_prsrp_rx0" != "0" && "$ssb_prsrp_rx0" != "" ]]; then
+					PRSRP="$ssb_prsrp_rx0 dBm | $ssb_prsrp_rx1 dBm | $ssb_prsrp_rx2 dBm | $ssb_prsrp_rx3 dBm"
+					PSINR="$ssb_psinr_rx0 dB | $ssb_psinr_rx1 dB | $ssb_psinr_rx2 dB | $ssb_psinr_rx3 dB"
+				else
+					PRSRP=""
+					PSINR=""
+				fi
+			elif [[ "$nr5g_cc_type" == *"NR SCC"* ]]; then
+				eval "json_get_var s${id}_rssi_rx0 rssi_rx0"
+				eval "json_get_var s${id}_rssi_rx1 rssi_rx1"
+				eval "json_get_var s${id}_rssi_rx2 rssi_rx2"
+				eval "json_get_var s${id}_rssi_rx3 rssi_rx3"
+				eval "json_get_var s${id}_trs_rsrp_rx0 trs_rsrp_rx0"
+				eval "json_get_var s${id}_trs_rsrp_rx1 trs_rsrp_rx1"
+				eval "json_get_var s${id}_trs_rsrp_rx2 trs_rsrp_rx2"
+				eval "json_get_var s${id}_trs_rsrp_rx3 trs_rsrp_rx3"
+				eval "json_get_var s${id}_trs_sinr_rx0 trs_snr_rx0"
+				eval "json_get_var s${id}_trs_sinr_rx1 trs_snr_rx1"
+				eval "json_get_var s${id}_trs_sinr_rx2 trs_snr_rx2"
+				eval "json_get_var s${id}_trs_sinr_rx3 trs_snr_rx3"
+				eval "json_get_var s${id}_ssb_rsrp_rx0 ssb_rsrp_rx0"
+				eval "json_get_var s${id}_ssb_rsrp_rx1 ssb_rsrp_rx1"
+				eval "json_get_var s${id}_ssb_rsrp_rx2 ssb_rsrp_rx2"
+				eval "json_get_var s${id}_ssb_rsrp_rx3 ssb_rsrp_rx3"
+				eval "json_get_var s${id}_ssb_sinr_rx0 ssb_snr_rx0"
+				eval "json_get_var s${id}_ssb_sinr_rx1 ssb_snr_rx1"
+				eval "json_get_var s${id}_ssb_sinr_rx2 ssb_snr_rx2"
+				eval "json_get_var s${id}_ssb_sinr_rx3 ssb_snr_rx3"
+				eval "trs_rsrp_value=\$s${id}_trs_rsrp_rx0"
+				eval "ssb_rsrp_value=\$s${id}_ssb_rsrp_rx0"
+				eval "S${id}RSSI=\"\$s${id}_rssi_rx0 dBm | \$s${id}_rssi_rx1 dBm | \$s${id}_rssi_rx2 dBm | \$s${id}_rssi_rx3 dBm\""
+				if [[ "$trs_rsrp_value" != "-255" && "$trs_rsrp_value" != "0" && "$trs_rsrp_value" != "" ]]; then
+					eval "S${id}RSRP=\"\$s${id}_trs_rsrp_rx0 dBm | \$s${id}_trs_rsrp_rx1 dBm | \$s${id}_trs_rsrp_rx2 dBm | \$s${id}_trs_rsrp_rx3 dBm\""
+					eval "S${id}SINR=\"\$s${id}_trs_sinr_rx0 dB | \$s${id}_trs_sinr_rx1 dB | \$s${id}_trs_sinr_rx2 dB | \$s${id}_trs_sinr_rx3 dB\""
+				elif [[ "$ssb_rsrp_value" != "-255" && "$ssb_rsrp_value" != "0" && "$ssb_rsrp_value" != "" ]]; then
+					eval "S${id}RSRP=\"\$s${id}_ssb_rsrp_rx0 dBm | \$s${id}_ssb_rsrp_rx1 dBm | \$s${id}_ssb_rsrp_rx2 dBm | \$s${id}_ssb_rsrp_rx3 dBm\""
+					eval "S${id}SINR=\"\$s${id}_ssb_sinr_rx0 dB | \$s${id}_ssb_sinr_rx1 dB | \$s${id}_ssb_sinr_rx2 dB | \$s${id}_ssb_sinr_rx3 dB\""
+				else
+					eval "S${id}RSRP=\"\""
+					eval "S${id}SINR=\"\""
+				fi
+			fi
+			json_select ..
+			idx=$((idx + 1))
+			id=$((id + 1))
+		done
+		json_select ..
+	fi
+elif [ "$CA_MODE" = "LTE" ] || [ "$CA_MODE" = "LTE-CA" ] ; then
+	json_select "lte_info"
+	json_select "1"
+	json_get_var lte_cc_num lte_cc_num
+	if json_is_a "lte_cc_info" array; then
+		json_select "lte_cc_info"
+		id=0
+		idx=1
+		while json_is_a "$idx" object; do
+			json_select "$idx"
+			json_get_var lte_cc_type lte_cc_type
+			if [ "$lte_cc_type" = "LTE PCC" ]; then
+				json_get_var prssi_rx0 rssi_rx0
+				json_get_var prssi_rx1 rssi_rx1
+				json_get_var prssi_rx2 rssi_rx2
+				json_get_var prssi_rx3 rssi_rx3
+				json_get_var prsrp_rx0 rsrp_rx0
+				json_get_var prsrp_rx1 rsrp_rx1
+				json_get_var prsrp_rx2 rsrp_rx2
+				json_get_var prsrp_rx3 rsrp_rx3
+				json_get_var psinr_rx0 snr_rx0
+				json_get_var psinr_rx1 snr_rx1
+				json_get_var psinr_rx2 snr_rx2
+				json_get_var psinr_rx3 snr_rx3
+				PRSSI="$prssi_rx0 dBm | $prssi_rx1 dBm | $prssi_rx2 dBm | $prssi_rx3 dBm"
+				PRSRP="$prsrp_rx0 dBm | $prsrp_rx1 dBm | $prsrp_rx2 dBm | $prsrp_rx3 dBm"
+				PSINR="$psinr_rx0 dB | $psinr_rx1 dB | $psinr_rx2 dB | $psinr_rx3 dB"
+			elif [[ "$lte_cc_type" == *"LTE SCC"* ]]; then
+				eval "json_get_var s${id}_rssi_rx0 rssi_rx0"
+				eval "json_get_var s${id}_rssi_rx1 rssi_rx1"
+				eval "json_get_var s${id}_rssi_rx2 rssi_rx2"
+				eval "json_get_var s${id}_rssi_rx3 rssi_rx3"
+				eval "json_get_var s${id}_rsrp_rx0 rsrp_rx0"
+				eval "json_get_var s${id}_rsrp_rx1 rsrp_rx1"
+				eval "json_get_var s${id}_rsrp_rx2 rsrp_rx2"
+				eval "json_get_var s${id}_rsrp_rx3 rsrp_rx3"
+				eval "json_get_var s${id}_sinr_rx0 sinr_rx0"
+				eval "json_get_var s${id}_sinr_rx1 sinr_rx1"
+				eval "json_get_var s${id}_sinr_rx2 sinr_rx2"
+				eval "json_get_var s${id}_sinr_rx3 sinr_rx3"
+				eval "S${id}RSSI=\"\$s${id}_rssi_rx0 dBm | \$s${id}_rssi_rx1 dBm | \$s${id}_rssi_rx2 dBm | \$s${id}_rssi_rx3 dBm\""
+				eval "S${id}RSRP=\"\$s${id}_rsrp_rx0 dBm | \$s${id}_rsrp_rx1 dBm | \$s${id}_rsrp_rx2 dBm | \$s${id}_rsrp_rx3 dBm\""
+				eval "S${id}SINR=\"\$s${id}_sinr_rx0 dB | \$s${id}_sinr_rx1 dB | \$s${id}_sinr_rx2 dB | \$s${id}_sinr_rx3 dB\""
+			fi
+			json_select ..
+			idx=$((idx + 1))
+			id=$((id + 1))
+		done
+		json_select ..
+	fi
+elif [ "$CA_MODE" = "LTE-ENDC" ] || [ "$CA_MODE" = "NR-ENDC" ] ; then
+	json_select "nr_info"
+	json_select "1"
+	json_get_var nr_cc_num nr_cc_num
+	if json_is_a "nr_cc_info" array; then
+		json_select "nr_cc_info"
+		id=1
+		idx=1
+		while json_is_a "$idx" object; do
+			json_select "$idx"
+			json_get_var nr5g_cc_type nr5g_cc_type
+			if [[ "$nr5g_cc_type" == *"NR SCC"* ]]; then
+				eval "json_get_var s${id}_rssi_rx0 rssi_rx0"
+				eval "json_get_var s${id}_rssi_rx1 rssi_rx1"
+				eval "json_get_var s${id}_rssi_rx2 rssi_rx2"
+				eval "json_get_var s${id}_rssi_rx3 rssi_rx3"
+				eval "json_get_var s${id}_trs_rsrp_rx0 trs_rsrp_rx0"
+				eval "json_get_var s${id}_trs_rsrp_rx1 trs_rsrp_rx1"
+				eval "json_get_var s${id}_trs_rsrp_rx2 trs_rsrp_rx2"
+				eval "json_get_var s${id}_trs_rsrp_rx3 trs_rsrp_rx3"
+				eval "json_get_var s${id}_trs_sinr_rx0 trs_snr_rx0"
+				eval "json_get_var s${id}_trs_sinr_rx1 trs_snr_rx1"
+				eval "json_get_var s${id}_trs_sinr_rx2 trs_snr_rx2"
+				eval "json_get_var s${id}_trs_sinr_rx3 trs_snr_rx3"
+				eval "json_get_var s${id}_ssb_rsrp_rx0 ssb_rsrp_rx0"
+				eval "json_get_var s${id}_ssb_rsrp_rx1 ssb_rsrp_rx1"
+				eval "json_get_var s${id}_ssb_rsrp_rx2 ssb_rsrp_rx2"
+				eval "json_get_var s${id}_ssb_rsrp_rx3 ssb_rsrp_rx3"
+				eval "json_get_var s${id}_ssb_sinr_rx0 ssb_snr_rx0"
+				eval "json_get_var s${id}_ssb_sinr_rx1 ssb_snr_rx1"
+				eval "json_get_var s${id}_ssb_sinr_rx2 ssb_snr_rx2"
+				eval "json_get_var s${id}_ssb_sinr_rx3 ssb_snr_rx3"
+				eval "trs_rsrp_value=\$s${id}_trs_rsrp_rx0"
+				eval "ssb_rsrp_value=\$s${id}_ssb_rsrp_rx0"
+				eval "S${id}RSSI=\"\$s${id}_rssi_rx0 dBm | \$s${id}_rssi_rx1 dBm | \$s${id}_rssi_rx2 dBm | \$s${id}_rssi_rx3 dBm\""
+				if [[ "$trs_rsrp_value" != "-255" && "$trs_rsrp_value" != "0" && "$trs_rsrp_value" != "" ]]; then
+					eval "S${id}RSRP=\"\$s${id}_trs_rsrp_rx0 dBm | \$s${id}_trs_rsrp_rx1 dBm | \$s${id}_trs_rsrp_rx2 dBm | \$s${id}_trs_rsrp_rx3 dBm\""
+					eval "S${id}SINR=\"\$s${id}_trs_sinr_rx0 dB | \$s${id}_trs_sinr_rx1 dB | \$s${id}_trs_sinr_rx2 dB | \$s${id}_trs_sinr_rx3 dB\""
+				elif [[ "$ssb_rsrp_value" != "-255" && "$ssb_rsrp_value" != "0" && "$ssb_rsrp_value" != "" ]]; then
+					eval "S${id}RSRP=\"\$s${id}_ssb_rsrp_rx0 dBm | \$s${id}_ssb_rsrp_rx1 dBm | \$s${id}_ssb_rsrp_rx2 dBm | \$s${id}_ssb_rsrp_rx3 dBm\""
+					eval "S${id}SINR=\"\$s${id}_ssb_sinr_rx0 dB | \$s${id}_ssb_sinr_rx1 dB | \$s${id}_ssb_sinr_rx2 dB | \$s${id}_ssb_sinr_rx3 dB\""
+				else
+					eval "S${id}RSRP=\"\""
+					eval "S${id}SINR=\"\""
+				fi
+			fi
+			json_select ..
+			idx=$((idx + 1))
+			id=$((id + 1))
+		done
+		json_select ..
+	fi
+	json_select "lte_info"
+	json_select "1"
+	json_get_var lte_cc_num lte_cc_num
+	if json_is_a "lte_cc_info" array; then
+		json_select "lte_cc_info"
+		id=1
+		idx=1
+		while json_is_a "$idx" object; do
+			json_select "$idx"
+			json_get_var lte_cc_type lte_cc_type
+			known_cc_num=$nr_cc_num+$id
+			if [ "$lte_cc_type" = "LTE PCC" ]; then
+				json_get_var prssi_rx0 rssi_rx0
+				json_get_var prssi_rx1 rssi_rx1
+				json_get_var prssi_rx2 rssi_rx2
+				json_get_var prssi_rx3 rssi_rx3
+				json_get_var prsrp_rx0 rsrp_rx0
+				json_get_var prsrp_rx1 rsrp_rx1
+				json_get_var prsrp_rx2 rsrp_rx2
+				json_get_var prsrp_rx3 rsrp_rx3
+				json_get_var psinr_rx0 snr_rx0
+				json_get_var psinr_rx1 snr_rx1
+				json_get_var psinr_rx2 snr_rx2
+				json_get_var psinr_rx3 snr_rx3
+				PRSSI="$prssi_rx0 dBm | $prssi_rx1 dBm | $prssi_rx2 dBm | $prssi_rx3 dBm"
+				PRSRP="$prsrp_rx0 dBm | $prsrp_rx1 dBm | $prsrp_rx2 dBm | $prsrp_rx3 dBm"
+				PSINR="$psinr_rx0 dB | $psinr_rx1 dB | $psinr_rx2 dB | $psinr_rx3 dB"
+			elif [[ "$lte_cc_type" == *"LTE SCC"* ]]; then
+				eval "json_get_var s${known_cc_num}_rssi_rx0 rssi_rx0"
+				eval "json_get_var s${known_cc_num}_rssi_rx1 rssi_rx1"
+				eval "json_get_var s${known_cc_num}_rssi_rx2 rssi_rx2"
+				eval "json_get_var s${known_cc_num}_rssi_rx3 rssi_rx3"
+				eval "json_get_var s${known_cc_num}_rsrp_rx0 rsrp_rx0"
+				eval "json_get_var s${known_cc_num}_rsrp_rx1 rsrp_rx1"
+				eval "json_get_var s${known_cc_num}_rsrp_rx2 rsrp_rx2"
+				eval "json_get_var s${known_cc_num}_rsrp_rx3 rsrp_rx3"
+				eval "json_get_var s${known_cc_num}_sinr_rx0 sinr_rx0"
+				eval "json_get_var s${known_cc_num}_sinr_rx1 sinr_rx1"
+				eval "json_get_var s${known_cc_num}_sinr_rx2 sinr_rx2"
+				eval "json_get_var s${known_cc_num}_sinr_rx3 sinr_rx3"
+				eval "S${known_cc_num}RSSI=\"\$s${known_cc_num}_rssi_rx0 dBm | \$s${known_cc_num}_rssi_rx1 dBm | \$s${known_cc_num}_rssi_rx2 dBm | \$s${known_cc_num}_rssi_rx3 dBm\""
+				eval "S${known_cc_num}RSRP=\"\$s${known_cc_num}_rsrp_rx0 dBm | \$s${known_cc_num}_rsrp_rx1 dBm | \$s${known_cc_num}_rsrp_rx2 dBm | \$s${known_cc_num}_rsrp_rx3 dBm\""
+				eval "S${known_cc_num}SINR=\"\$s${known_cc_num}_sinr_rx0 dB | \$s${known_cc_num}_sinr_rx1 dB | \$s${known_cc_num}_sinr_rx2 dB | \$s${known_cc_num}_sinr_rx3 dB\""
+			fi
+			json_select ..
+			idx=$((idx + 1))
+			id=$((id + 1))
+		done
+		json_select ..
+	fi
+fi
+
+if [ "${LAC_DEC}" = "0" ]; then
+	LAC_DEC="-"
+	LAC_HEX="-"
+fi
+
+# Modem
+FWA=$(mipc_wan_cli --at_cmd "AT+GMR" | sed 's/\r//g')
+FW=$(echo $FWA | sed 's/.*: //;s/,.*//;s/ /\./g' | tr -s "\n")
+
+# MODELA=$(mipc_wan_cli --at_cmd "AT+CGMM" | sed 's/\r//g' | tr -s "\n")
+# MODELB=$(mipc_wan_cli --at_cmd "AT+CGMI" | sed 's/\r//g' | tr -s "\n")
+MODELACUT=$(mipc_wan_cli --at_cmd "AT+CGMM" | sed 's/\r//g' | tr -s "\n" | sed -n '2p')
+MODELBCUT=$(mipc_wan_cli --at_cmd "AT+CGMI" | sed 's/\r//g' | tr -s "\n" | sed -n '2p')
+MODEL="$MODELBCUT "$MODELACUT
+
+# Slot SIM
+O=$(mipc_wan_cli --at_cmd "AT+QUIMSLOT?")
+T=$(echo "$O" | awk -F [:] '/^\+QUIMSLOT/{print $2}' | xargs)
+if [ -n "$T" ]; then
+	SSIM="$T"
+fi
+
+# International Mobile Equipment Identity (IMEI)
+O=$(mipc_wan_cli --at_cmd "AT+EGMR=0,7")
+NR_I=$(echo "$O" | awk -F [:] '/^\+EGMR/{print $2}' | xargs)
+if [ -n "$NR_I" ]; then
+	NR_IMEI="$NR_I"
+fi
+
+# International Mobile Subscriber Identity (IMSI)
+O=$(mipc_wan_cli --at_cmd "AT+CIMI")
+NR_C=$(echo "$O" | sed -n '2p' )
+if [ -n "$NR_C" ]; then
+	NR_IMSI="$NR_C"
+fi
+
+#  Integrated Circuit Card Identifier (ICCID)
+O=$(mipc_wan_cli --at_cmd "AT+ICCID")
+NR_D=$(echo "$O" | awk -F [:] '/^\+ICCID/{print $2}' | xargs)
+if [ -n "$NR_D" ]; then
+	NR_ICCID="$NR_D"
+fi
+
+# Protocol
+PROTO="MIPC"
