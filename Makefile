@@ -24,11 +24,18 @@ define Package/luci-app-3ginfo-lite/description
  cell details, APN, IMEI, SIM and TTL settings.
 endef
 
+define Package/luci-app-3ginfo-lite/conffiles
+/etc/config/3ginfo
+/etc/config/3ginfo_ttl
+endef
+
 define Build/Compile
 endef
 
 define Package/luci-app-3ginfo-lite/install
-	$(CP) ./files/* $(1)/
+	$(CP) ./root/* $(1)/
+	$(INSTALL_DIR) $(1)/www
+	$(CP) ./htdocs/* $(1)/www/
 endef
 
 $(eval $(call BuildPackage,luci-app-3ginfo-lite))

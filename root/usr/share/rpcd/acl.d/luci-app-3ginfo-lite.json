@@ -1,0 +1,44 @@
+{
+	"luci-app-3ginfo-lite": {
+		"description": "Grant access to LuCI app 3ginfo-lite",
+		"read": {
+   			"cgi-io": [ "exec" ],
+    			"file": {
+				"/usr/share/3ginfo-lite/3ginfo.sh": [ "exec" ],
+				"/usr/share/3ginfo-lite/detect.sh": [ "exec" ],
+				"/usr/share/3ginfo-lite/check.gcom": [ "exec" ],
+				"/usr/share/3ginfo-lite/info.gcom": [ "exec" ],
+				"/usr/share/3ginfo-lite/celllock.sh": [ "exec" ],
+				"/bin/modem_status": [ "exec" ],
+				"/etc/modemdefine": [ "read" ],
+				"/etc/3ginfo": [ "read" ],
+				"/tmp/modem_cell_info.json": [ "read" ],
+				"/tmp/cell_info": [ "read" ],
+				"/sys/kernel/debug/usb/devices": [ "read" ]
+			},
+			"uci": [ "3ginfo", "3ginfo_ttl", "network" ]
+		},
+		"write": {
+			"file": {
+				"/bin/cat": [ "exec" ],
+				"/bin/sh -x /usr/share/3ginfo-lite/3ginfo.sh": [ "exec" ],
+				"/bin/ls /dev": [ "exec" ],
+				"/bin/modem_status --cell_info": [ "exec" ],
+				"/bin/modem_status --at_cmd *": [ "exec" ],
+				"/bin/modem_status --get_imei": [ "exec" ],
+				"/bin/modem_status --set_imei *": [ "exec" ],
+				"/bin/modem_status --set_celllock *": [ "exec" ],
+				"/bin/modem_status --get_bandlock": [ "exec" ],
+				"/bin/modem_status --set_bandlock *": [ "exec" ],
+				"/sbin/ifup wan": [ "exec" ],
+				"/usr/share/3ginfo-lite/celllock.sh": [ "exec" ],
+				"/usr/share/3ginfo-lite/celllock.sh lock *": [ "exec" ],
+				"/usr/share/3ginfo-lite/celllock.sh unlock": [ "exec" ],
+				"/etc/modemdefine": [ "write" ],
+				"/tmp/debug_result.txt": [ "write" ],
+				"/etc/3ginfo": [ "write" ]
+			},
+			"uci": [ "3ginfo", "3ginfo_ttl", "network" ]
+		}
+	}
+}
